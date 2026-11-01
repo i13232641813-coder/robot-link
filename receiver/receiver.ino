@@ -45,10 +45,10 @@ char    ck[3];
 uint8_t ckLen = 0;
 State   state = WAIT_HEAD;
 
-// 协议第 4 节的六个字段
+// 协议第 4 节的六个字段（x/y 用有符号，允许负坐标）
 struct Target {
-  uint16_t x;
-  uint16_t y;
+  int16_t  x;
+  int16_t  y;
   uint8_t  conf;
   uint8_t  valid;
   uint32_t ts;
@@ -84,7 +84,7 @@ void handleFrame() {
     return;
   }
 
-  int n = sscanf(buf, "%hu,%hu,%hhu,%hhu,%u,%hhu",
+  int n = sscanf(buf, "%hd,%hd,%hhu,%hhu,%u,%hhu",
                  &t.x, &t.y, &t.conf, &t.valid, &t.ts, &t.seq);
   if (n != 6) {
     badFrames++;
@@ -101,7 +101,7 @@ void handleFrame() {
   }
 
   // ---- 唯一给 VOFA+ 的数据行，格式不能动 ----
-  Serial.printf("x:%u,y:%u,conf:%u,valid:%u\n", t.x, t.y, t.conf, t.valid);
+  Serial.printf("x:%d,y:%d,conf:%u,valid:%u\n", t.x, t.y, t.conf, t.valid);
 
   DBG("  parsed: ts=%u seq=%u\n", t.ts, t.seq);
 }
@@ -148,7 +148,7 @@ void checkTimeout() {
     linkAlive = false;
     DBG("!! link timeout (%lu ms)\n", millis() - lastGoodMs);
     // 保持上一次坐标，但明确告诉上层这帧无效
-    Serial.printf("x:%u,y:%u,conf:0,valid:0\n", t.x, t.y);
+    Serial.printf("x:%d,y:%d,conf:0,valid:0\n", t.x, t.y);
   }
 }
 

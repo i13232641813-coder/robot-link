@@ -14,54 +14,52 @@
 
 // ---------- 可改配置 ----------
 #define LINK_SERIAL   Serial2
-#define LINK_TX_PIN   17      // A.TX -> B.RX，按实际接线改
-#define LINK_RX_PIN   16      // 单向发送，RX 仅占位（填一个存在的 GPIO 即可）
+#define LINK_TX_PIN   17
+#define LINK_RX_PIN   16
 #define LINK_BAUD     115200
-#define PERIOD_MS     20      // 50 Hz（每 20ms 一帧）
+#define PERIOD_MS     20
 
 uint8_t seq = 0;
 
-// 组帧并发送：$x,y,conf,valid,ts,seq*XX\r\n
 void buildAndSend(int16_t x, int16_t y, uint8_t conf, uint8_t valid, uint32_t ts) {
   String payload = String(x) + "," + String(y) + "," + String(conf) + "," +
                    String(valid) + "," + String(ts) + "," + String(seq);
 
-  // 对 payload 逐字节异或
   uint8_t xorv = 0;
   for (char c : payload) xorv ^= (uint8_t)c;
 
   LINK_SERIAL.print('$');
   LINK_SERIAL.print(payload);
   LINK_SERIAL.print('*');
-  if (xorv < 16) LINK_SERIAL.print('0');   // 补零到两位
-  LINK_SERIAL.print(xorv, HEX);            // 大写十六进制
+  if (xorv < 16) LINK_SERIAL.print('0');
+  LINK_SERIAL.print(xorv, HEX);
   LINK_SERIAL.print("\r\n");
 
-  seq = (seq + 1) & 0xFF;                  // 0~255 回绕
+  //=====新增USB给VOFA输出=====
+  Serial.printf("%d,%d,%d,%d,%lu,%u\n", x, y, conf, valid, ts, seq);
+
+  seq = (seq + 1) & 0xFF;
 }
 
 void setup() {
   LINK_SERIAL.begin(LINK_BAUD, SERIAL_8N1, LINK_RX_PIN, LINK_TX_PIN);
+  Serial.begin(115200);   // 开启USB串口！！必须加
 }
 
 void loop() {
   uint32_t ts = millis();
-
-  // ===== 数据源（替换这里） =====
-  // 下面只是演示：做圆周运动的目标，每 6 秒丢 1 秒目标（valid=0，照常发帧）。
-  // 真正作业时，把 x/y/conf/valid 换成你的视觉算法输出即可，其余不用动。
   int16_t x = 0, y = 0;
   uint8_t conf = 0, valid = 0;
   if ((ts / 1000) % 6 == 5) {
-    valid = 0; x = 0; y = 0; conf = 0;          // 无目标：照常发帧，valid=0
+    valid = 0; x = 0; y = 0; conf = 0;
   } else {
     float a = ts * 0.0008f;
     x = (int16_t)(500 * cos(a));
     y = (int16_t)(500 * sin(a));
     conf = 95; valid = 1;
   }
-  // ============================
 
   buildAndSend(x, y, conf, valid, ts);
-  delay(PERIOD_MS);                              // 50 Hz
+  delay(PERIOD_MS);
 }
+

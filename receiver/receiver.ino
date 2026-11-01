@@ -16,11 +16,14 @@
 
 // ==================== 配置区（只改这里） ====================
 
-#define DEBUG_PRINT   1     // 1 = 调试模式，串口监视器能看细节
+#define DEBUG_PRINT   0     // 1 = 调试模式，串口监视器能看细节
                             // 0 = 正式模式，只输出 FireWater 数据行
 
 #define TEST_WITH_USB 1     // 1 = 单板自测：从电脑串口监视器收帧
                             // 0 = 正式：从另一块板子收（Serial2）
+
+#define SELF_TEST     0     // 1 = 板子自己造正弦数据，只为验证 VOFA+ 配置对不对
+                            //     打开时不需要任何外部数据，配合 DEBUG_PRINT 0 用
 
 #define LINK_RX_PIN   16    // 接收端 RX，接发送端的 TX
 #define LINK_TX_PIN   17    // 接收端 TX，接发送端的 RX
@@ -168,6 +171,20 @@ void reportStats() {
 #endif
 }
 
+// 仅用于验证 VOFA+ 配置：板子自己按 50Hz 造一组圆周运动数据，
+// 不接收任何串口输入。看到两条正弦曲线，说明上位机这边全配对了。
+void selfTest() {
+  static unsigned long lastMs = 0;
+  if (millis() - lastMs < 20) return;
+  lastMs = millis();
+
+  float a = millis() * 0.0008f;
+  int16_t x = (int16_t)(500 * cos(a));
+  int16_t y = (int16_t)(500 * sin(a));
+
+  Serial.printf("x:%d,y:%d,conf:%d,valid:%d\n", x, y, 95, 1);
+}
+
 void setup() {
   Serial.begin(115200);
   delay(300);
@@ -187,6 +204,11 @@ void setup() {
 }
 
 void loop() {
+#if SELF_TEST
+  selfTest();
+  return;
+#endif
+
   while (link->available() > 0) {
     rxBytes++;
     feed((char)link->read());

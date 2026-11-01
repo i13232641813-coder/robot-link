@@ -1,29 +1,39 @@
-// receiver.ino —— 接收端 · 台阶 3：校验，拒绝坏帧
+// receiver.ino —— 接收端 · 台阶 4：把载荷拆成六个数字
 //
-// 台阶 2 能找到边界了，但那时候不管数据对不对，收到就打。
-// 这一台阶开始回答：这帧数据是真的，还是半路被干扰坏的？
+// 前三台阶解决了"字节怎么进来、帧在哪、数据是不是真的"。
+// 这一台阶把字符串 "473,126,87,1,12345,42" 变成六个能直接用的数字。
 //
-// 做法：多一个状态。看见 '*' 之后不是马上完事，还要再收两个字符（校验值），
-//       然后把载荷逐字节异或，跟收到的比对。一致才认，不一致整帧丢掉。
+// 用的工具是 sscanf。它按格式串逐个匹配，返回【成功解析了几个】。
+// 这个返回值必须检查 —— 少一个字段它不会报错，只是少填一个变量，
+// 而没被填的变量里是内存里的随机值，后面的逻辑就全乱了。
 //
-// 一个必须记住的细节：
-//   校验值 20 在串口上是【两个字符】'2' 和 '0'（0x32 0x30），
-//   不是一个字节 0x20。所以要用 strtoul 把字符串转成数值再比。
-//   直接比字符串的话，'2a' 和 '2A' 会被判成不一样，其实数值都是 0x2A。
+// 格式符对照（ESP32 上）：
+//   uint16_t → %hu      uint8_t → %hhu      uint32_t → %u
+//   （如果以后换到 AVR 板子，uint32_t 要改成 %lu，这是平台差异）
 
 enum State { WAIT_HEAD, IN_PAYLOAD, IN_CHECKSUM };
 
-const int BUF_SIZE = 64;        // 载荷最长 64 字节，协议第 8 节定的
+const int BUF_SIZE = 64;
 
 char buf[BUF_SIZE];
 uint8_t len = 0;
-
-char ck[3];                     // 两位校验字符 + 结尾的 '\0'
+char ck[3];
 uint8_t ckLen = 0;
 
 State state = WAIT_HEAD;
 
-// 对 buf 里前 n 个字节逐字节异或 —— 这就是协议第 5 节的算法
+// 解析结果放这里，六个字段和协议第 4 节一一对应
+struct Target {
+  uint16_t x;
+  uint16_t y;
+  uint8_t  conf;
+  uint8_t  valid;
+  uint32_t ts;
+  uint8_t  seq;
+};
+
+Target t;
+
 uint8_t calcXor(const char *s, int n) {
   uint8_t x = 0;
   for (int i = 0; i < n; i++) x ^= (uint8_t)s[i];
@@ -33,7 +43,7 @@ uint8_t calcXor(const char *s, int n) {
 void setup() {
   Serial.begin(115200);
   delay(300);
-  Serial.println("\n=== receiver ready (step 3) ===");
+  Serial.println("\n=== receiver ready (step 4) ===");
 }
 
 void loop() {
@@ -42,7 +52,6 @@ void loop() {
 
     switch (state) {
 
-      // 状态一：等帧头，不是 '$' 的字节全部丢掉
       case WAIT_HEAD:
         if (c == '$') {
           state = IN_PAYLOAD;
@@ -50,7 +59,6 @@ void loop() {
         }
         break;
 
-      // 状态二：攒载荷，直到看见 '*'
       case IN_PAYLOAD:
         if (c == '*') {
           state = IN_CHECKSUM;
@@ -64,22 +72,28 @@ void loop() {
         }
         break;
 
-      // 状态三：收两位校验，凑齐就比对
       case IN_CHECKSUM:
         ck[ckLen++] = c;
         if (ckLen == 2) {
           ck[2] = '\0';
           buf[len] = '\0';
 
-          uint8_t expected = calcXor(buf, len);          // 自己算的
-          uint8_t got = (uint8_t)strtoul(ck, NULL, 16);  // 收到的（按十六进制解析）
+          uint8_t expected = calcXor(buf, len);
+          uint8_t got = (uint8_t)strtoul(ck, NULL, 16);
 
           if (expected == got) {
-            Serial.printf("OK   payload[%d]: %s\n", len, buf);
-            // 台阶 4 会在这里把 buf 拆成六个数字
+            // ---- 台阶 4 新增的部分 ----
+            int n = sscanf(buf, "%hu,%hu,%hhu,%hhu,%u,%hhu",
+                           &t.x, &t.y, &t.conf, &t.valid, &t.ts, &t.seq);
+            if (n == 6) {
+              Serial.printf("x=%u  y=%u  conf=%u  valid=%u  ts=%u  seq=%u\n",
+                            t.x, t.y, t.conf, t.valid, t.ts, t.seq);
+              // 台阶 5 会在这里把 t 转成 VOFA+ 能认的格式
+            } else {
+              Serial.printf("BAD  fields=%d (expect 6)  payload: %s\n", n, buf);
+            }
           } else {
             Serial.printf("BAD  calc=%02X got=%s  payload: %s\n", expected, ck, buf);
-            // 坏帧只报告，不回复、不要求重传 —— 协议第 8 节
           }
           state = WAIT_HEAD;
         }

@@ -16,10 +16,10 @@
 
 // ==================== 配置区（只改这里） ====================
 
-#define DEBUG_PRINT   0     // 1 = 调试模式，串口监视器能看细节
+#define DEBUG_PRINT   1     // 1 = 调试模式，串口监视器能看细节
                             // 0 = 正式模式，只输出 FireWater 数据行
 
-#define TEST_WITH_USB 1     // 1 = 单板自测：从电脑串口监视器收帧
+#define TEST_WITH_USB 0     // 1 = 单板自测：从电脑串口监视器收帧
                             // 0 = 正式：从另一块板子收（Serial2）
 
 #define SELF_TEST     0     // 1 = 板子自己造正弦数据，只为验证 VOFA+ 配置对不对
@@ -60,7 +60,10 @@ struct Target {
 
 Target t;
 
-Stream* link = nullptr;              // 数据来源，setup() 里决定
+// 数据来源，setup() 里决定。
+// 注意：不能叫 link —— POSIX 的 unistd.h 里有 int link(const char*, const char*)，
+// ESP32 核心会把它带进来，全局同名变量会撞车（redeclared as different kind of entity）。
+Stream* linkPort = nullptr;
 
 unsigned long lastGoodMs  = 0;       // 最近一次收到有效帧的时刻
 bool          linkAlive   = false;
@@ -191,11 +194,11 @@ void setup() {
   DBG("\n=== receiver ready (final v1.0) ===\n");
 
 #if TEST_WITH_USB
-  link = &Serial;
+  linkPort = &Serial;
   DBG("[cfg] 数据源 = USB 串口（单板自测模式）\n");
 #else
   Serial2.begin(LINK_BAUD, SERIAL_8N1, LINK_RX_PIN, LINK_TX_PIN);
-  link = &Serial2;
+  linkPort = &Serial2;
   DBG("[cfg] 数据源 = Serial2  RX=%d TX=%d  %d bps\n",
       LINK_RX_PIN, LINK_TX_PIN, LINK_BAUD);
 #endif
@@ -209,9 +212,9 @@ void loop() {
   return;
 #endif
 
-  while (link->available() > 0) {
+  while (linkPort->available() > 0) {
     rxBytes++;
-    feed((char)link->read());
+    feed((char)linkPort->read());
   }
   checkTimeout();
   reportStats();

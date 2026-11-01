@@ -1,18 +1,35 @@
-// receiver.ino —— 接收端 · 台阶 5：输出成 VOFA+ 能认的格式
+// ============================================================
+//  receiver.ino —— 双板通信 · 接收端（最终版 v1.0）
+//  协议见同仓库 README.md v1.0
 //
-// 前四个台阶把数据解析出来了，但输出的是给人看的调试文本。
-// VOFA+ 不认那个，它要的是 FireWater 协议：
+//  数据流：
+//    发送端板子 --UART--> [Serial2] --> 本程序 --> [Serial/USB] --> VOFA+
 //
-//     x:473,y:126,conf:87,valid:1\n
+//  接线（只发一个方向，所以最少两根线）：
+//    发送端 TX  --->  接收端 GPIO16 (RX)      ← 必须交叉
+//    发送端 GND ---  接收端 GND               ← 必须共地，漏了就是乱码
+//    接收端 GPIO17 (TX) ---> 发送端 RX        ← 可选，本协议单向不需要
 //
-// 规则就三条：名字:数值、逗号分隔、一行一帧以 \n 结尾。
-// VOFA+ 靠"名字"自动建通道，靠 \n 判断一帧结束。
-//
-// 为什么要有 DEBUG_PRINT 开关：
-//   VOFA+ 的数据行必须是【纯数据】，混进一行 "BAD calc=..." 它就解析失败。
-//   调试时打开看细节，接 VOFA+ 时改成 0，只留数据行。
+//  注意：ESP32-WROVER（带 PSRAM）的 GPIO16/17 被 PSRAM 占用，
+//        如果是 WROVER 板子，把下面两个引脚改成 25/26。
+// ============================================================
 
-#define DEBUG_PRINT 1        // 1 = 串口监视器调试模式    0 = VOFA+ 模式
+// ==================== 配置区（只改这里） ====================
+
+#define DEBUG_PRINT   1     // 1 = 调试模式，串口监视器能看细节
+                            // 0 = 正式模式，只输出 FireWater 数据行
+
+#define TEST_WITH_USB 1     // 1 = 单板自测：从电脑串口监视器收帧
+                            // 0 = 正式：从另一块板子收（Serial2）
+
+#define LINK_RX_PIN   16    // 接收端 RX，接发送端的 TX
+#define LINK_TX_PIN   17    // 接收端 TX，接发送端的 RX
+#define LINK_BAUD     115200
+
+#define LINK_TIMEOUT_MS 200 // 协议第 6 节：200ms 没收到有效帧算超时
+#define BUF_SIZE      64    // 载荷上限，协议第 8 节
+
+// ==================== 以下不用改 ====================
 
 #if DEBUG_PRINT
   #define DBG(...) Serial.printf(__VA_ARGS__)
@@ -22,15 +39,13 @@
 
 enum State { WAIT_HEAD, IN_PAYLOAD, IN_CHECKSUM };
 
-const int BUF_SIZE = 64;
-
-char buf[BUF_SIZE];
-uint8_t len = 0;
-char ck[3];
+char    buf[BUF_SIZE];
+uint8_t len   = 0;
+char    ck[3];
 uint8_t ckLen = 0;
+State   state = WAIT_HEAD;
 
-State state = WAIT_HEAD;
-
+// 协议第 4 节的六个字段
 struct Target {
   uint16_t x;
   uint16_t y;
@@ -42,72 +57,137 @@ struct Target {
 
 Target t;
 
+Stream* link = nullptr;              // 数据来源，setup() 里决定
+
+unsigned long lastGoodMs  = 0;       // 最近一次收到有效帧的时刻
+bool          linkAlive   = false;
+unsigned long goodFrames  = 0;
+unsigned long badFrames   = 0;
+
+// 对 buf 前 n 个字节逐字节异或（协议第 5 节）
 uint8_t calcXor(const char *s, int n) {
-  uint8_t x = 0;
-  for (int i = 0; i < n; i++) x ^= (uint8_t)s[i];
-  return x;
+  uint8_t v = 0;
+  for (int i = 0; i < n; i++) v ^= (uint8_t)s[i];
+  return v;
+}
+
+// 一帧收齐了，校验 + 拆分 + 输出
+void handleFrame() {
+  buf[len] = '\0';
+
+  uint8_t expected = calcXor(buf, len);
+  uint8_t got      = (uint8_t)strtoul(ck, NULL, 16);
+
+  if (expected != got) {
+    badFrames++;
+    DBG("BAD  checksum calc=%02X got=%s  payload: %s\n", expected, ck, buf);
+    return;
+  }
+
+  int n = sscanf(buf, "%hu,%hu,%hhu,%hhu,%u,%hhu",
+                 &t.x, &t.y, &t.conf, &t.valid, &t.ts, &t.seq);
+  if (n != 6) {
+    badFrames++;
+    DBG("BAD  fields=%d (expect 6)  payload: %s\n", n, buf);
+    return;
+  }
+
+  goodFrames++;
+  lastGoodMs = millis();
+
+  if (!linkAlive) {
+    linkAlive = true;
+    DBG("[link] up\n");
+  }
+
+  // ---- 唯一给 VOFA+ 的数据行，格式不能动 ----
+  Serial.printf("x:%u,y:%u,conf:%u,valid:%u\n", t.x, t.y, t.conf, t.valid);
+
+  DBG("  parsed: ts=%u seq=%u\n", t.ts, t.seq);
+}
+
+// 逐字节推进状态机
+void feed(char c) {
+  switch (state) {
+
+    case WAIT_HEAD:
+      if (c == '$') {
+        state = IN_PAYLOAD;
+        len = 0;
+      }
+      break;
+
+    case IN_PAYLOAD:
+      if (c == '*') {
+        state = IN_CHECKSUM;
+        ckLen = 0;
+      } else if (len < BUF_SIZE - 1) {
+        buf[len++] = c;
+      } else {
+        badFrames++;
+        DBG("BAD  overflow, drop frame\n");
+        state = WAIT_HEAD;
+        len = 0;
+      }
+      break;
+
+    case IN_CHECKSUM:
+      ck[ckLen++] = c;
+      if (ckLen == 2) {
+        ck[2] = '\0';
+        handleFrame();
+        state = WAIT_HEAD;
+      }
+      break;
+  }
+}
+
+// 超时检测：只在状态翻转那一刻输出一次，不刷屏
+void checkTimeout() {
+  if (linkAlive && millis() - lastGoodMs > LINK_TIMEOUT_MS) {
+    linkAlive = false;
+    DBG("!! link timeout (%lu ms)\n", millis() - lastGoodMs);
+    // 保持上一次坐标，但明确告诉上层这帧无效
+    Serial.printf("x:%u,y:%u,conf:0,valid:0\n", t.x, t.y);
+  }
+}
+
+// 每秒报一次收发统计，只在有新数据时才打
+void reportStats() {
+#if DEBUG_PRINT
+  static unsigned long lastReport = 0;
+  static unsigned long lastTotal  = 0;
+  unsigned long total = goodFrames + badFrames;
+  if (total != lastTotal && millis() - lastReport >= 1000) {
+    lastReport = millis();
+    lastTotal  = total;
+    DBG("[stat] good=%lu  bad=%lu\n", goodFrames, badFrames);
+  }
+#endif
 }
 
 void setup() {
   Serial.begin(115200);
   delay(300);
-  DBG("\n=== receiver ready (step 5) ===\n");
+  DBG("\n=== receiver ready (final v1.0) ===\n");
+
+#if TEST_WITH_USB
+  link = &Serial;
+  DBG("[cfg] 数据源 = USB 串口（单板自测模式）\n");
+#else
+  Serial2.begin(LINK_BAUD, SERIAL_8N1, LINK_RX_PIN, LINK_TX_PIN);
+  link = &Serial2;
+  DBG("[cfg] 数据源 = Serial2  RX=%d TX=%d  %d bps\n",
+      LINK_RX_PIN, LINK_TX_PIN, LINK_BAUD);
+#endif
+
+  DBG("[cfg] 超时阈值 %d ms\n", LINK_TIMEOUT_MS);
 }
 
 void loop() {
-  while (Serial.available() > 0) {
-    char c = Serial.read();
-
-    switch (state) {
-
-      case WAIT_HEAD:
-        if (c == '$') {
-          state = IN_PAYLOAD;
-          len = 0;
-        }
-        break;
-
-      case IN_PAYLOAD:
-        if (c == '*') {
-          state = IN_CHECKSUM;
-          ckLen = 0;
-        } else if (len < BUF_SIZE - 1) {
-          buf[len++] = c;
-        } else {
-          DBG("!! overflow, drop frame\n");
-          state = WAIT_HEAD;
-          len = 0;
-        }
-        break;
-
-      case IN_CHECKSUM:
-        ck[ckLen++] = c;
-        if (ckLen == 2) {
-          ck[2] = '\0';
-          buf[len] = '\0';
-
-          uint8_t expected = calcXor(buf, len);
-          uint8_t got = (uint8_t)strtoul(ck, NULL, 16);
-
-          if (expected == got) {
-            int n = sscanf(buf, "%hu,%hu,%hhu,%hhu,%u,%hhu",
-                           &t.x, &t.y, &t.conf, &t.valid, &t.ts, &t.seq);
-
-            if (n == 6) {
-              // ---- 这一行就是给 VOFA+ 的，格式不能动 ----
-              Serial.printf("x:%u,y:%u,conf:%u,valid:%u\n",
-                            t.x, t.y, t.conf, t.valid);
-
-              DBG("  parsed: ts=%u seq=%u\n", t.ts, t.seq);
-            } else {
-              DBG("BAD  fields=%d (expect 6)  payload: %s\n", n, buf);
-            }
-          } else {
-            DBG("BAD  calc=%02X got=%s  payload: %s\n", expected, ck, buf);
-          }
-          state = WAIT_HEAD;
-        }
-        break;
-    }
+  while (link->available() > 0) {
+    feed((char)link->read());
   }
+  checkTimeout();
+  reportStats();
 }

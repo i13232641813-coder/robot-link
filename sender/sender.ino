@@ -1,65 +1,94 @@
 /*
- * sender/sender.ino  —  视觉电控通信协议 · 发送端（ESP32）
- * 依据仓库根目录 README.md（v0.9）实现，改协议前请先和接收端确认。
- *
- * A 板（发送端 / 视觉侧）：算出目标 -> 组帧 -> 从 UART 单向发给 B 板（接收端）。
+ * sender/sender.ino — 视觉电控通信协议 · A板发送端 ESP32
+ * 协议版本 v0.9，依据仓库README.md实现
  * 帧格式：$<x>,<y>,<conf>,<valid>,<ts>,<seq>*<XX>\r\n
- *   - x,y    : int16，毫米
- *   - conf   : uint8，0~100
- *   - valid  : uint8，0/1（无目标时=0，但照常发帧，不停车）
- *   - ts     : uint32，发送端 millis() 毫秒时间戳
- *   - seq    : uint8，每帧 +1，255 后回绕到 0
- *   - XX     : 对 $ 与 * 之间全部字符逐字节异或，两位大写十六进制
+ * A板TX(GPIO17) → B板RX；GND必须共地
  */
 
-// ---------- 可改配置 ----------
-#define LINK_SERIAL   Serial2
-#define LINK_TX_PIN   17
-#define LINK_RX_PIN   16
-#define LINK_BAUD     115200
-#define PERIOD_MS     20
+// ------------配置区，和README文档保持一致------------
+#define LINK_SERIAL     Serial2
+#define LINK_TX_PIN     17      // A板TX引脚，接接收板B的RX
+#define LINK_RX_PIN     16      // 单向发送，RX仅占位
+#define LINK_BAUD       115200
+#define PERIOD_MS       20      // 50Hz发送周期
 
-uint8_t seq = 0;
+uint8_t seq = 0;   //帧序号，0~255循环
 
-void buildAndSend(int16_t x, int16_t y, uint8_t conf, uint8_t valid, uint32_t ts) {
-  String payload = String(x) + "," + String(y) + "," + String(conf) + "," +
-                   String(valid) + "," + String(ts) + "," + String(seq);
+/**
+ * @brief 组帧并且通过LINK_SERIAL发送，严格遵守协议
+ * @param x int16 横坐标mm
+ * @param y int16 纵坐标mm
+ * @param conf uint8 置信度0~100
+ * @param valid uint8 0无目标 /1有目标
+ * @param ts uint32 millis()发送端毫秒时间戳
+ */
+void buildAndSend(int16_t x, int16_t y, uint8_t conf, uint8_t valid, uint32_t ts)
+{
+    // payload：$ 和 * 中间全部内容，6个逗号分隔字段
+    String payload = String(x) + ","
+                   + String(y) + ","
+                   + String(conf) + ","
+                   + String(valid) + ","
+                   + String(ts) + ","
+                   + String(seq);
 
-  uint8_t xorv = 0;
-  for (char c : payload) xorv ^= (uint8_t)c;
+    // 异或校验：只对payload全部字节运算，不含$ * \r\n
+    uint8_t xorCheck = 0;
+    for (size_t i = 0; i < payload.length(); i++)
+    {
+        xorCheck ^= (uint8_t)payload.charAt(i);
+    }
 
-  LINK_SERIAL.print('$');
-  LINK_SERIAL.print(payload);
-  LINK_SERIAL.print('*');
-  if (xorv < 16) LINK_SERIAL.print('0');
-  LINK_SERIAL.print(xorv, HEX);
-  LINK_SERIAL.print("\r\n");
+    // 输出完整协议帧 $payload*XX\r\n
+    LINK_SERIAL.print('$');
+    LINK_SERIAL.print(payload);
+    LINK_SERIAL.print('*');
+    // 输出两位大写十六进制，小于0x10前面补'0'
+    if(xorCheck < 0x10){
+        LINK_SERIAL.print('0');
+    }
+    LINK_SERIAL.print(xorCheck, HEX);
+    LINK_SERIAL.print("\r\n");  //文档规定行结束符\r\n
 
-  //=====新增USB给VOFA输出=====
-  Serial.printf("%d,%d,%d,%d,%lu,%u\n", x, y, conf, valid, ts, seq);
+    // =========调试选项：开启后USB Serial输出裸CSV给VOFA调试（正式双板联调不依赖此段）=========
+    // Serial.printf("%d,%d,%d,%d,%lu,%u\n", x, y, conf, valid, ts, seq);
 
-  seq = (seq + 1) & 0xFF;
+    seq = (seq + 1) & 0xFF;  // 0‑255回绕
 }
 
-void setup() {
-  LINK_SERIAL.begin(LINK_BAUD, SERIAL_8N1, LINK_RX_PIN, LINK_TX_PIN);
-  Serial.begin(115200);   // 开启USB串口！！必须加
+void setup()
+{
+    //板间通信串口
+    LINK_SERIAL.begin(LINK_BAUD, SERIAL_8N1, LINK_RX_PIN, LINK_TX_PIN);
+    // 如需VOFA直接看发送端数据，取消下面这行注释
+    // Serial.begin(115200);
 }
 
-void loop() {
-  uint32_t ts = millis();
-  int16_t x = 0, y = 0;
-  uint8_t conf = 0, valid = 0;
-  if ((ts / 1000) % 6 == 5) {
-    valid = 0; x = 0; y = 0; conf = 0;
-  } else {
-    float a = ts * 0.0008f;
-    x = (int16_t)(500 * cos(a));
-    y = (int16_t)(500 * sin(a));
-    conf = 95; valid = 1;
-  }
+void loop()
+{
+    uint32_t ts = millis();
+    int16_t x = 0, y = 0;
+    uint8_t conf = 0, valid = 0;
 
-  buildAndSend(x, y, conf, valid, ts);
-  delay(PERIOD_MS);
+    //模拟数据源：每6秒里面有1秒 valid=0（无目标，照常发帧，禁止停发）
+    if ((ts / 1000UL) % 6UL == 5UL)
+    {
+        valid = 0;
+        x = 0;
+        y = 0;
+        conf = 0;
+    }
+    else
+    {
+        float angle = ts * 0.0008f;
+        x = (int16_t)(500 * cos(angle));
+        y = (int16_t)(500 * sin(angle));
+        conf = 95;
+        valid = 1;
+    }
+
+    buildAndSend(x, y, conf, valid, ts);
+    delay(PERIOD_MS);
 }
+
 

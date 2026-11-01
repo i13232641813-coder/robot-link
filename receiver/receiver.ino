@@ -1,56 +1,89 @@
-// receiver.ino —— 接收端 · 台阶 2：找到帧的边界
+// receiver.ino —— 接收端 · 台阶 3：校验，拒绝坏帧
 //
-// 台阶 1 证明了"字节能进来"，但那时候所有字节都一视同仁。
-// 这一台阶要回答一个问题：这一堆字节里，哪一段才是一帧？
+// 台阶 2 能找到边界了，但那时候不管数据对不对，收到就打。
+// 这一台阶开始回答：这帧数据是真的，还是半路被干扰坏的？
 //
-// 做法：一个两状态的状态机。
-//   inPayload = false  —— 我在等帧头，不是 '$' 的字节全部丢掉
-//   inPayload = true   —— 我看到 '$' 了，开始把字节攒进 buf，直到看见 '*'
+// 做法：多一个状态。看见 '*' 之后不是马上完事，还要再收两个字符（校验值），
+//       然后把载荷逐字节异或，跟收到的比对。一致才认，不一致整帧丢掉。
 //
-// 为什么不能"等一整行再解析"？
-//   串口是字节流，你不知道一帧什么时候到齐。万一中途丢了一个字节
-//   （干扰、板子复位、电脑卡了一下），整行就会错位，而且你不会发现。
-//   用 '$' 当同步点，接收端随时能重新对齐 —— 这叫自恢复能力。
-//
-// 这一台阶还不校验，所以坏帧也会被打印出来。这是故意的，校验是台阶 3 的事。
+// 一个必须记住的细节：
+//   校验值 20 在串口上是【两个字符】'2' 和 '0'（0x32 0x30），
+//   不是一个字节 0x20。所以要用 strtoul 把字符串转成数值再比。
+//   直接比字符串的话，'2a' 和 '2A' 会被判成不一样，其实数值都是 0x2A。
+
+enum State { WAIT_HEAD, IN_PAYLOAD, IN_CHECKSUM };
 
 const int BUF_SIZE = 64;        // 载荷最长 64 字节，协议第 8 节定的
 
 char buf[BUF_SIZE];
 uint8_t len = 0;
-bool inPayload = false;         // false = 等帧头，true = 正在攒载荷
+
+char ck[3];                     // 两位校验字符 + 结尾的 '\0'
+uint8_t ckLen = 0;
+
+State state = WAIT_HEAD;
+
+// 对 buf 里前 n 个字节逐字节异或 —— 这就是协议第 5 节的算法
+uint8_t calcXor(const char *s, int n) {
+  uint8_t x = 0;
+  for (int i = 0; i < n; i++) x ^= (uint8_t)s[i];
+  return x;
+}
 
 void setup() {
   Serial.begin(115200);
   delay(300);
-  Serial.println("\n=== receiver ready (step 2) ===");
+  Serial.println("\n=== receiver ready (step 3) ===");
 }
 
 void loop() {
   while (Serial.available() > 0) {
     char c = Serial.read();
 
-    if (!inPayload) {
-      // 状态一：等帧头。只有 '$' 能让我进入下一状态
-      if (c == '$') {
-        inPayload = true;
-        len = 0;              // 重新开始，清掉上一帧的残留
-      }
-      // 其他字符一律无视 —— 这就是"丢弃垃圾数据"
-    } else {
-      // 状态二：正在攒载荷
-      if (c == '*') {
-        buf[len] = '\0';      // C 字符串必须以 0 结尾，否则 printf 会读飞
-        Serial.printf("payload[%d]: %s\n", len, buf);
-        inPayload = false;    // 这一帧结束，回去等下一个 '$'
-      } else if (len < BUF_SIZE - 1) {
-        buf[len++] = c;       // 存一个字节，计数器 +1
-      } else {
-        // 攒了 63 个字节还没见到 '*'，判定为垃圾数据，放弃这一帧
-        Serial.println("!! overflow, drop frame");
-        inPayload = false;
-        len = 0;
-      }
+    switch (state) {
+
+      // 状态一：等帧头，不是 '$' 的字节全部丢掉
+      case WAIT_HEAD:
+        if (c == '$') {
+          state = IN_PAYLOAD;
+          len = 0;
+        }
+        break;
+
+      // 状态二：攒载荷，直到看见 '*'
+      case IN_PAYLOAD:
+        if (c == '*') {
+          state = IN_CHECKSUM;
+          ckLen = 0;
+        } else if (len < BUF_SIZE - 1) {
+          buf[len++] = c;
+        } else {
+          Serial.println("!! overflow, drop frame");
+          state = WAIT_HEAD;
+          len = 0;
+        }
+        break;
+
+      // 状态三：收两位校验，凑齐就比对
+      case IN_CHECKSUM:
+        ck[ckLen++] = c;
+        if (ckLen == 2) {
+          ck[2] = '\0';
+          buf[len] = '\0';
+
+          uint8_t expected = calcXor(buf, len);          // 自己算的
+          uint8_t got = (uint8_t)strtoul(ck, NULL, 16);  // 收到的（按十六进制解析）
+
+          if (expected == got) {
+            Serial.printf("OK   payload[%d]: %s\n", len, buf);
+            // 台阶 4 会在这里把 buf 拆成六个数字
+          } else {
+            Serial.printf("BAD  calc=%02X got=%s  payload: %s\n", expected, ck, buf);
+            // 坏帧只报告，不回复、不要求重传 —— 协议第 8 节
+          }
+          state = WAIT_HEAD;
+        }
+        break;
     }
   }
 }

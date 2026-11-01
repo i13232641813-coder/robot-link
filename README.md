@@ -158,3 +158,61 @@ checksum = 两位大写十六进制，不足补 0
 | | | | |
 
 > 规则：**改一次协议，升一次版本号**，并且两端代码**同一次提交**一起改。
+
+---
+
+## 12. 怎么跑 / 怎么协作
+
+### 仓库地址
+
+```
+https://github.com/i13232641813-coder/robot-link
+```
+
+私有仓库，**必须先被加为协作者才能 clone**。
+
+### 第一次拿到代码
+
+```bash
+git clone https://github.com/i13232641813-coder/robot-link.git
+cd robot-link
+```
+
+不想用命令行的话，装 **GitHub Desktop**，登录后 `File → Clone repository` 选 robot-link 即可。
+
+### 日常流程（两个人都在 main 上干活）
+
+```bash
+git pull --rebase        # 每次开始干活前，先拉别人的改动
+# ... 改代码 ...
+git add -A
+git commit -m "feat: 发送端实现组帧与异或校验"
+git pull --rebase        # 提交前再拉一次，避免冲突
+git push
+```
+
+**不要两个人同时改同一个文件。** 分工本来就是一人一端，sender/ 和 receiver/ 天然不冲突。真正会撞的是 README.md —— 改协议前先在群里说一声。
+
+### commit message 规范
+
+格式：`类型: 中文说明`
+
+| 类型 | 用在什么时候 |
+|---|---|
+| `feat` | 新增功能 |
+| `fix` | 修 bug |
+| `docs` | 只改文档 |
+| `refactor` | 重构，行为不变 |
+
+不合格的写法：`update`、`fix`、`111`、`.`、`改了一下`。半年后回来看，这些等于没写。
+
+### 两条硬规则
+
+1. **改协议 = 两端同一次提交。** 只改一端，另一端当天必炸。
+2. **提交前必须能编译通过。** 不要把编译不过的代码推上去，那会让搭档没法干活。
+
+### 上传代码到板子
+
+Arduino IDE 打开 `sender/sender.ino` 或 `receiver/receiver.ino` 直接上传。
+板子选 `ESP32 Dev Module`，端口选 CP210x 那个（本机是 COM5）。
+

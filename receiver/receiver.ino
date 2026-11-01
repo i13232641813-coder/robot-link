@@ -61,6 +61,7 @@ Stream* link = nullptr;              // 数据来源，setup() 里决定
 
 unsigned long lastGoodMs  = 0;       // 最近一次收到有效帧的时刻
 bool          linkAlive   = false;
+unsigned long rxBytes     = 0;       // 一共收到多少字节（排障用）
 unsigned long goodFrames  = 0;
 unsigned long badFrames   = 0;
 
@@ -152,16 +153,17 @@ void checkTimeout() {
   }
 }
 
-// 每秒报一次收发统计，只在有新数据时才打
+// 每秒报一次收发统计，只在有新字节时才打
+// rx  = 收到的原始字节数（接线通不通看这个）
+// good/bad = 解析结果，两者都是 0 而 rx 在涨，说明字节进来了但成不了帧
 void reportStats() {
 #if DEBUG_PRINT
   static unsigned long lastReport = 0;
-  static unsigned long lastTotal  = 0;
-  unsigned long total = goodFrames + badFrames;
-  if (total != lastTotal && millis() - lastReport >= 1000) {
+  static unsigned long lastRx     = 0;
+  if (rxBytes != lastRx && millis() - lastReport >= 1000) {
     lastReport = millis();
-    lastTotal  = total;
-    DBG("[stat] good=%lu  bad=%lu\n", goodFrames, badFrames);
+    lastRx     = rxBytes;
+    DBG("[stat] rx=%lu  good=%lu  bad=%lu\n", rxBytes, goodFrames, badFrames);
   }
 #endif
 }
@@ -186,6 +188,7 @@ void setup() {
 
 void loop() {
   while (link->available() > 0) {
+    rxBytes++;
     feed((char)link->read());
   }
   checkTimeout();

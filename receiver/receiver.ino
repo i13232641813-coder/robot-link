@@ -1,28 +1,56 @@
-// receiver.ino —— 接收端 · 台阶 1：只验证"字节能进来"
+// receiver.ino —— 接收端 · 台阶 2：找到帧的边界
 //
-// 现在的功能：收到什么字节，就按十六进制原样打出来。
-// 还不管帧头、不管校验、不拆字段 —— 那些是后面几个台阶的事。
+// 台阶 1 证明了"字节能进来"，但那时候所有字节都一视同仁。
+// 这一台阶要回答一个问题：这一堆字节里，哪一段才是一帧？
 //
-// 怎么测：
-//   1. 上传（底部出现绿色的 Done uploading）
-//   2. 打开串口监视器，右下角波特率选 115200
-//   3. 先确认看到 "=== receiver ready ==="
-//   4. 输入框里敲  $473,126,87,1,12345,42*20  然后回车
-//   5. 应该看到 [24][34][37][33][2C]... 一长串
-//      [24] 就是 '$'，[2A] 是 '*'，最后 [0D][0A] 是回车换行
+// 做法：一个两状态的状态机。
+//   inPayload = false  —— 我在等帧头，不是 '$' 的字节全部丢掉
+//   inPayload = true   —— 我看到 '$' 了，开始把字节攒进 buf，直到看见 '*'
+//
+// 为什么不能"等一整行再解析"？
+//   串口是字节流，你不知道一帧什么时候到齐。万一中途丢了一个字节
+//   （干扰、板子复位、电脑卡了一下），整行就会错位，而且你不会发现。
+//   用 '$' 当同步点，接收端随时能重新对齐 —— 这叫自恢复能力。
+//
+// 这一台阶还不校验，所以坏帧也会被打印出来。这是故意的，校验是台阶 3 的事。
+
+const int BUF_SIZE = 64;        // 载荷最长 64 字节，协议第 8 节定的
+
+char buf[BUF_SIZE];
+uint8_t len = 0;
+bool inPayload = false;         // false = 等帧头，true = 正在攒载荷
 
 void setup() {
-  Serial.begin(115200);           // 和电脑说话，115200 是协议里定的波特率
-  delay(300);                     // 等 USB 串口就绪，少了这行开头几个字符会丢
-  Serial.println();
-  Serial.println("=== receiver ready ===");
+  Serial.begin(115200);
+  delay(300);
+  Serial.println("\n=== receiver ready (step 2) ===");
 }
 
 void loop() {
-  // available() 返回"缓冲区里还有几个字节没读"
-  // 一次可能连着来好几个字节，所以用 while 全部读干净
   while (Serial.available() > 0) {
-    uint8_t b = Serial.read();    // 读一个字节，范围 0~255
-    Serial.printf("[%02X]", b);   // 按两位十六进制打印，不足两位前面补 0
+    char c = Serial.read();
+
+    if (!inPayload) {
+      // 状态一：等帧头。只有 '$' 能让我进入下一状态
+      if (c == '$') {
+        inPayload = true;
+        len = 0;              // 重新开始，清掉上一帧的残留
+      }
+      // 其他字符一律无视 —— 这就是"丢弃垃圾数据"
+    } else {
+      // 状态二：正在攒载荷
+      if (c == '*') {
+        buf[len] = '\0';      // C 字符串必须以 0 结尾，否则 printf 会读飞
+        Serial.printf("payload[%d]: %s\n", len, buf);
+        inPayload = false;    // 这一帧结束，回去等下一个 '$'
+      } else if (len < BUF_SIZE - 1) {
+        buf[len++] = c;       // 存一个字节，计数器 +1
+      } else {
+        // 攒了 63 个字节还没见到 '*'，判定为垃圾数据，放弃这一帧
+        Serial.println("!! overflow, drop frame");
+        inPayload = false;
+        len = 0;
+      }
+    }
   }
 }
